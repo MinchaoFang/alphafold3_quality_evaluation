@@ -22,7 +22,6 @@ https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 from collections.abc import Callable, Iterable, Sequence
 import csv
 import dataclasses
-import datetime
 import functools
 import multiprocessing
 import os
@@ -32,11 +31,14 @@ import string
 import textwrap
 import time
 import typing
-from typing import Protocol, Self, TypeVar, overload
-import sys
-sys.path.append('/storage/caolongxingLab/fangminchao/miniconda3/envs/jax')
+from typing import Final, Protocol, Self, TypeVar, overload
 from absl import app
 from absl import flags
+import sys
+sys.path.insert(0, '/storage/caolongxingLab/fangminchao/work/alphafold3_quality_evaluation')
+
+# 检查结果
+print(sys.path)
 from alphafold3.common import base_config
 from alphafold3.common import folding_input
 from alphafold3.common import resources
@@ -51,20 +53,41 @@ from alphafold3.model import post_processing
 from alphafold3.model.components import base_model
 from alphafold3.model.components import utils
 from alphafold3.model.diffusion import model as diffusion_model
+print(alphafold3.cpp.__file__)
 import haiku as hk
 import jax
 from jax import numpy as jnp
 import numpy as np
+#jax.config.update("jax_disable_jit", True)
+import numpy as np
+from typing import Dict, Any, Optional
+import pickle
 
-_HOME_DIR = pathlib.Path("/storage/caolongxingLab/fangminchao")
-_DEFAULT_MODEL_DIR = _HOME_DIR / 'tools/alphafold3/model'
-_DEFAULT_DB_DIR = _HOME_DIR / 'database/AF3/public_databases'
+_HOME_DIR = pathlib.Path("root")
+_DEFAULT_MODEL_DIR = _HOME_DIR / 'models'
+_DEFAULT_DB_DIR = _HOME_DIR / 'public_databases'
+
 
 # Input and output paths.
 _JSON_PATH = flags.DEFINE_string(
     'json_path',
     None,
     'Path to the input JSON file.',
+)
+_REF_PDB_PATH = flags.DEFINE_string(
+    'ref_pdb_path',
+    None,
+    'Path to the input ref pdb file.',
+)
+_REF_TIME_STEPS = flags.DEFINE_integer(
+    'ref_time_steps',
+    0,
+    'total 200 steps, input the steps you want',
+)
+_REF_PKL_DUMP_PATH =  flags.DEFINE_string(
+    'ref_pkl_dump_path',
+    None,
+    'Path to dumped pkl path, for debug only',
 )
 _INPUT_DIR = flags.DEFINE_string(
     'input_dir',
@@ -76,16 +99,31 @@ _OUTPUT_DIR = flags.DEFINE_string(
     None,
     'Path to a directory where the results will be saved.',
 )
-MODEL_DIR = flags.DEFINE_string(
+
+_MODEL_DIR = flags.DEFINE_string(
     'model_dir',
     _DEFAULT_MODEL_DIR.as_posix(),
     'Path to the model to use for inference.',
 )
 
+_FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
+    'flash_attention_implementation',
+    default='triton',
+    enum_values=['triton', 'cudnn', 'xla'],
+    help=(
+        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
+        ' Triton and cuDNN flash attention implementation, respectively. The'
+        ' Triton kernel is fastest and has been tested more thoroughly. The'
+        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
+        ' XLA attention implementation (no flash attention) and is portable'
+        ' across GPU devices.'
+    ),
+)
+
 # Control which stages to run.
 _RUN_DATA_PIPELINE = flags.DEFINE_bool(
     'run_data_pipeline',
-    True,
+    False,
     'Whether to run the data pipeline on the fold inputs.',
 )
 _RUN_INFERENCE = flags.DEFINE_bool(
@@ -122,13 +160,11 @@ _HMMBUILD_BINARY_PATH = flags.DEFINE_string(
 )
 
 # Database paths.
-DB_DIR = flags.DEFINE_multi_string(
+_DB_DIR = flags.DEFINE_string(
     'db_dir',
-    (_DEFAULT_DB_DIR.as_posix(),),
-    'Path to the directory containing the databases. Can be specified multiple'
-    ' times to search multiple directories in order.',
+    _DEFAULT_DB_DIR.as_posix(),
+    'Path to the directory containing the databases.',
 )
-
 _SMALL_BFD_DATABASE_PATH = flags.DEFINE_string(
     'small_bfd_database_path',
     '${DB_DIR}/bfd-first_non_consensus_sequences.fasta',
@@ -167,7 +203,7 @@ _RNA_CENTRAL_DATABASE_PATH = flags.DEFINE_string(
 )
 _PDB_DATABASE_PATH = flags.DEFINE_string(
     'pdb_database_path',
-    '${DB_DIR}/mmcif_files',
+    '${DB_DIR}/pdb_2022_09_28_mmcif_files.tar',
     'PDB database directory with mmCIF files path, used for template search.',
 )
 _SEQRES_DATABASE_PATH = flags.DEFINE_string(
@@ -190,57 +226,179 @@ _NHMMER_N_CPU = flags.DEFINE_integer(
     ' beyond 8 CPUs provides very little additional speedup.',
 )
 
-# Template search configuration.
-_MAX_TEMPLATE_DATE = flags.DEFINE_string(
-    'max_template_date',
-    '2021-09-30',  # By default, use the date from the AlphaFold 3 paper.
-    'Maximum template release date to consider. Format: YYYY-MM-DD. All '
-    'templates released after this date will be ignored.',
-)
-
-_CONFORMER_MAX_ITERATIONS = flags.DEFINE_integer(
-    'conformer_max_iterations',
-    None,  # Default to RDKit default parameters value.
-    'Optional override for maximum number of iterations to run for RDKit '
-    'conformer search.',
-)
-
-# JAX inference performance tuning.
+# Compilation cache
 _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
     'jax_compilation_cache_dir',
     None,
     'Path to a directory for the JAX compilation cache.',
 )
-_BUCKETS = flags.DEFINE_list(
-    'buckets',
-    # pyformat: disable
-    ['256', '512', '768', '1024', '1280', '1536', '2048', '2560', '3072',
-     '3584', '4096', '4608', '5120'],
-    # pyformat: enable
-    'Strictly increasing order of token sizes for which to cache compilations.'
-    ' For any input with more tokens than the largest bucket size, a new bucket'
-    ' is created for exactly that number of tokens.',
+
+_BUCKETS: Final[tuple[int, ...]] = (
+    256,
+    512,
+    768,
+    1024,
+    1280,
+    1536,
+    2048,
+    2560,
+    3072,
+    3584,
+    4096,
+    4608,
+    5120,
 )
-_FLASH_ATTENTION_IMPLEMENTATION = flags.DEFINE_enum(
-    'flash_attention_implementation',
-    default='triton',
-    enum_values=['triton', 'cudnn', 'xla'],
-    help=(
-        "Flash attention implementation to use. 'triton' and 'cudnn' uses a"
-        ' Triton and cuDNN flash attention implementation, respectively. The'
-        ' Triton kernel is fastest and has been tested more thoroughly. The'
-        " Triton and cuDNN kernels require Ampere GPUs or later. 'xla' uses an"
-        ' XLA attention implementation (no flash attention) and is portable'
-        ' across GPU devices.'
-    ),
-)
-_NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
-    'num_diffusion_samples',
-    5,
-    'Number of diffusion samples to generate.',
-)
+# Atom mapping directly
+DENSE_ATOM = {
+    # Protein
+    "ALA": ("N", "CA", "C", "O", "CB"),
+    "ARG": ("N", "CA", "C", "O", "CB", "CG", "CD", "NE", "CZ", "NH1", "NH2"),
+    "ASN": ("N", "CA", "C", "O", "CB", "CG", "OD1", "ND2"),
+    "ASP": ("N", "CA", "C", "O", "CB", "CG", "OD1", "OD2"),
+    "CYS": ("N", "CA", "C", "O", "CB", "SG"),
+    "GLN": ("N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "NE2"),
+    "GLU": ("N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "OE2"),
+    "GLY": ("N", "CA", "C", "O"),
+    "HIS": ("N", "CA", "C", "O", "CB", "CG", "ND1", "CD2", "CE1", "NE2"),
+    "ILE": ("N", "CA", "C", "O", "CB", "CG1", "CG2", "CD1"),
+    "LEU": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2"),
+    "LYS": ("N", "CA", "C", "O", "CB", "CG", "CD", "CE", "NZ"),
+    "MET": ("N", "CA", "C", "O", "CB", "CG", "SD", "CE"),
+    "PHE": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ"),
+    "PRO": ("N", "CA", "C", "O", "CB", "CG", "CD"),
+    "SER": ("N", "CA", "C", "O", "CB", "OG"),
+    "THR": ("N", "CA", "C", "O", "CB", "OG1", "CG2"),
+    "TRP": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"),
+    "TYR": ("N", "CA", "C", "O", "CB", "CG", "CD1", "CD2", "CE1", "CE2", "CZ", "OH"),
+    "VAL": ("N", "CA", "C", "O", "CB", "CG1", "CG2"),
+    "UNK": (),
+    # RNA
+    "A": ("OP3", "P", "OP1", "OP2", "O5PRIME", "C5PRIME", "C4PRIME", "O4PRIME", "C3PRIME", "O3PRIME",
+          "C2PRIME", "O2PRIME", "C1PRIME", "N9", "C8", "N7", "C5", "C6", "N6", "N1", "C2", "N3", "C4"),
+    "C": ("OP3", "P", "OP1", "OP2", "O5PRIME", "C5PRIME", "C4PRIME", "O4PRIME", "C3PRIME", "O3PRIME",
+          "C2PRIME", "O2PRIME", "C1PRIME", "N1", "C2", "O2", "N3", "C4", "N4", "C5", "C6"),
+    "G": ("OP3", "P", "OP1", "OP2", "O5PRIME", "C5PRIME", "C4PRIME", "O4PRIME", "C3PRIME", "O3PRIME",
+          "C2PRIME", "O2PRIME", "C1PRIME", "N9", "C8", "N7", "C5", "C6", "O6", "N1", "C2", "N2", "N3", "C4"),
+    "U": ("OP3", "P", "OP1", "OP2", "O5PRIME", "C5PRIME", "C4PRIME", "O4PRIME", "C3PRIME", "O3PRIME",
+          "C2PRIME", "O2PRIME", "C1PRIME", "N1", "C2", "O2", "N3", "C4", "O4", "C5", "C6"),
+    "UNK_RNA": (),
+    # DNA
+    "DA": ("OP3", "P", "OP1", "OP2", "O5PRIME", "C5PRIME", "C4PRIME", "O4PRIME", "C3PRIME", "O3PRIME",
+           "C2PRIME", "C1PRIME", "N9", "C8", "N7", "C5", "C6", "N6", "N1", "C2", "N3", "C4"),
+    "DC": ("OP3", "P", "OP1", "OP2", "O5PRIME", "C5PRIME", "C4PRIME", "O4PRIME", "C3PRIME", "O3PRIME",
+           "C2PRIME", "C1PRIME", "N1", "C2", "O2", "N3", "C4", "N4", "C5", "C6"),
+    "DG": ("OP3", "P", "OP1", "OP2", "O5PRIME", "C5PRIME", "C4PRIME", "O4PRIME", "C3PRIME", "O3PRIME",
+           "C2PRIME", "C1PRIME", "N9", "C8", "N7", "C5", "C6", "O6", "N1", "C2", "N2", "N3", "C4"),
+    "DT": ("OP3", "P", "OP1", "OP2", "O5PRIME", "C5PRIME", "C4PRIME", "O4PRIME", "C3PRIME", "O3PRIME",
+           "C2PRIME", "C1PRIME", "N1", "C2", "O2", "N3", "C4", "O4", "C5", "C7", "C6"),
+    "UNK_DNA": (),
+}
+import numpy as np
+import jax.numpy as jnp
+from typing import Dict, Tuple, List, Optional
+
+class StructureParser:
+    def __init__(self):
+        self.ATOM_RECORD_FORMAT = {
+            'record_name': (0, 6),
+            'atom_number': (6, 11),
+            'atom_name': (12, 16),
+            'alt_loc': (16, 17),
+            'res_name': (17, 20),
+            'chain_id': (21, 22),
+            'res_number': (22, 26),
+            'x': (30, 38),
+            'y': (38, 46),
+            'z': (46, 54),
+            'occupancy': (54, 60),
+            'temp_factor': (60, 66),
+            'element': (76, 78)
+        }
+    
+    def parse_pdb(self, file_path: str) -> Dict[str, List]:
+        """解析PDB文件并提取原子信息"""
+        coords=0
+                        
+        return coords
+    
+    def parse_cif(self, file_path: str) -> Dict[str, List]:
+        """解析mmCIF文件并提取原子信息"""
+        coords = 0
+        
+        return coords
+    
+           
+
+    def process_file(self, file_path: str) -> Dict:
+        """处理完整的文件并返回JAX可用的数据"""
+        if file_path.endswith('.pdb'):
+            coords = self.parse_pdb(file_path)
+        elif file_path.endswith('.cif'):
+            coords = self.parse_cif(file_path)
+        elif file_path.endswith('.pkl'):
+            with open(file_path, "rb") as f:
+                coords = pickle.load(f)
+        else:
+            raise ValueError("文件格式必须是.pdb or .cif or .pkl")
+            
+        return jnp.array(coords)
 
 
+
+class StructureFeatureIntegrator:
+    @staticmethod
+    def process_ref_file(ref_pdb_path: str) -> Dict[str, Any]:
+        """处理参考结构文件并提取特征"""
+        parser = StructureParser()
+        coords = parser.process_file(ref_pdb_path)
+        # 提取和处理参考结构特征
+        ref_features = {'ref_atom_positions': coords
+        }
+        return ref_features
+    
+    @staticmethod
+    def integrate_reference_features(
+        featurised_example: Dict[str, Any],
+        ref_structure_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """将参考结构特征集成到已特征化的示例中"""
+        # 深拷贝以避免修改原始数据
+        integrated_features = dict(featurised_example)
+        
+        # 添加参考结构特征
+        for key, value in ref_structure_data.items():
+            integrated_features[key] = value
+            
+        
+        return integrated_features
+    
+    
+    @staticmethod
+    def process_and_integrate(
+        featurised_example: Dict[str, Any],
+        ref_pdb_path: str,
+        device: Optional[jax.Device] = None
+    ) -> Dict[str, Any]:
+        """完整的处理和集成流程"""
+        device = device or jax.devices()[0]
+        # 处理参考结构
+        ref_structure_data = StructureFeatureIntegrator.process_ref_file(ref_pdb_path)
+        
+        # 集成特征
+        integrated_features = StructureFeatureIntegrator.integrate_reference_features(
+            featurised_example,
+            ref_structure_data
+        )
+
+        # 转换为设备数组
+        device_features = jax.device_put(
+            jax.tree_util.tree_map(
+                jnp.asarray,
+                integrated_features
+            ),
+            device
+        )
+        return device_features
 class ConfigurableModel(Protocol):
   """A model with a nested config class."""
 
@@ -267,16 +425,17 @@ def make_model_config(
     *,
     model_class: type[ModelT] = diffusion_model.Diffuser,
     flash_attention_implementation: attention.Implementation = 'triton',
-    num_diffusion_samples: int = 5,
+    ref_time_steps= 0,
 ):
-  """Returns a model config with some defaults overridden."""
   config = model_class.Config()
+
   if hasattr(config, 'global_config'):
     config.global_config.flash_attention_implementation = (
         flash_attention_implementation
     )
-  if hasattr(config, 'heads'):
-    config.heads.diffusion.eval.num_samples = num_diffusion_samples
+  if ref_time_steps !=0:
+    config.heads.diffusion.eval.ref_time_steps = ref_time_steps
+    config.heads.diffusion.eval.num_samples = 1
   return config
 
 
@@ -318,8 +477,12 @@ class ModelRunner:
     )
 
   def run_inference(
-      self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
-  ) -> base_model.ModelResult:
+    self, 
+    featurised_example: features.BatchDict, 
+    rng_key: jnp.ndarray, 
+    ref_pdb_path: os.PathLike[str] | None,  # 为 ref_pdb_path 添加类型注释
+    ref_pkl_dump_path: os.PathLike[str] | None,
+) -> base_model.ModelResult:
     """Computes a forward pass of the model on a featurised example."""
     featurised_example = jax.device_put(
         jax.tree_util.tree_map(
@@ -328,13 +491,31 @@ class ModelRunner:
         self._device,
     )
 
-    result = self._model(rng_key, featurised_example)
+    if ref_pdb_path :
+      print(f'Running ref_pdb guided prediction '+ref_pdb_path)
+      if not os.path.exists(ref_pdb_path):
+        raise FileNotFoundError(f"Ref PDB file not found: {ref_pdb_path}")
+      integrator = StructureFeatureIntegrator()
+      final_features = integrator.process_and_integrate(
+    featurised_example,
+    ref_pdb_path,
+      )
+      result = self._model(rng_key, final_features)
+    else:
+      print(f'No ref_pdb guided prediction')
+
+      result = self._model(rng_key, featurised_example)
     result = jax.tree.map(np.asarray, result)
     result = jax.tree.map(
         lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
         result,
     )
     result['__identifier__'] = result['__identifier__'].tobytes()
+    print(result["diffusion_samples"]["atom_positions"].shape)
+    if ref_pkl_dump_path:
+        print(f"dump pkl file in {ref_pkl_dump_path}")
+        with open(ref_pkl_dump_path, 'wb') as f:
+            pickle.dump(np.array(jax.device_get(result["diffusion_samples"]["atom_positions"])), f)
     return result
 
   def extract_structures(
@@ -370,8 +551,9 @@ class ResultsForSeed:
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
+    ref_pdb_path: os.PathLike[str] | str,
+    ref_pkl_dump_path: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
-    conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
   """Runs the full inference pipeline to predict structures for each seed."""
 
@@ -379,10 +561,7 @@ def predict_structure(
   featurisation_start_time = time.time()
   ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
   featurised_examples = featurisation.featurise_input(
-      fold_input=fold_input,
-      buckets=buckets,
-      ccd=ccd,
-      verbose=True
+      fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=True
   )
   print(
       f'Featurising data for seeds {fold_input.rng_seeds} took '
@@ -394,7 +573,7 @@ def predict_structure(
     print(f'Running model inference for seed {seed}...')
     inference_start_time = time.time()
     rng_key = jax.random.PRNGKey(seed)
-    result = model_runner.run_inference(example, rng_key)
+    result = model_runner.run_inference(example, rng_key,ref_pdb_path,ref_pkl_dump_path)
     print(
         f'Running model inference for seed {seed} took '
         f' {time.time() - inference_start_time:.2f} seconds.'
@@ -417,11 +596,11 @@ def predict_structure(
     )
     print(
         'Running model inference and extracting output structures for seed'
-        f' {seed} took {time.time() - inference_start_time:.2f} seconds.'
+        f' {seed} took  {time.time() - inference_start_time:.2f} seconds.'
     )
   print(
       'Running model inference and extracting output structures for seeds'
-      f' {fold_input.rng_seeds} took'
+      f' {fold_input.rng_seeds} took '
       f' {time.time() - all_inference_start_time:.2f} seconds.'
   )
   return all_inference_results
@@ -460,7 +639,7 @@ def write_outputs(
       sample_dir = os.path.join(output_dir, f'seed-{seed}_sample-{sample_idx}')
       os.makedirs(sample_dir, exist_ok=True)
       post_processing.write_output(
-          inference_result=result, output_dir=sample_dir
+          inference_result=result, output_dir=sample_dir,name=f'seed-{seed}_sample-{sample_idx}'
       )
       ranking_score = float(result.metadata['ranking_score'])
       ranking_scores.append((seed, sample_idx, ranking_score))
@@ -506,29 +685,14 @@ def process_fold_input(
   ...
 
 
-def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
-  """Replaces the DB_DIR placeholder in a path with the given DB_DIR."""
-  template = string.Template(path_with_db_dir)
-  if 'DB_DIR' in template.get_identifiers():
-    for db_dir in db_dirs:
-      path = template.substitute(DB_DIR=db_dir)
-      if os.path.exists(path):
-        return path
-    raise FileNotFoundError(
-        f'{path_with_db_dir} with ${{DB_DIR}} not found in any of {db_dirs}.'
-    )
-  if not os.path.exists(path_with_db_dir):
-    raise FileNotFoundError(f'{path_with_db_dir} does not exist.')
-  return path_with_db_dir
-
-
 def process_fold_input(
     fold_input: folding_input.Input,
     data_pipeline_config: pipeline.DataPipelineConfig | None,
     model_runner: ModelRunner | None,
     output_dir: os.PathLike[str] | str,
+    ref_pdb_path: os.PathLike[str] | None,
+    ref_pkl_dump_path: os.PathLike[str] | None,
     buckets: Sequence[int] | None = None,
-    conformer_max_iterations: int | None = None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
   """Runs data pipeline and/or inference on a single fold input.
 
@@ -543,8 +707,6 @@ def process_fold_input(
       number of tokens. If not None, must be a sequence of at least one integer,
       in strictly increasing order. Will raise an error if the number of tokens
       is more than the largest bucket size.
-    conformer_max_iterations: Optional override for maximum number of iterations
-      to run for RDKit conformer search.
 
   Returns:
     The processed fold input, or the inference results for each seed.
@@ -556,16 +718,6 @@ def process_fold_input(
 
   if not fold_input.chains:
     raise ValueError('Fold input has no chains.')
-
-  if os.path.exists(output_dir) and os.listdir(output_dir):
-    new_output_dir = (
-        f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
-    )
-    print(
-        f'Output directory {output_dir} exists and non-empty, using instead '
-        f' {new_output_dir}.'
-    )
-    output_dir = new_output_dir
 
   if model_runner is not None:
     # If we're running inference, check we can load the model parameters before
@@ -593,9 +745,9 @@ def process_fold_input(
     all_inference_results = predict_structure(
         fold_input=fold_input,
         model_runner=model_runner,
-        buckets=buckets,
-        conformer_max_iterations=conformer_max_iterations,
-    )
+        ref_pdb_path=ref_pdb_path,
+        ref_pkl_dump_path=ref_pkl_dump_path,
+        buckets=buckets)
     print(
         f'Writing outputs for {fold_input.name} for seed(s)'
         f' {fold_input.rng_seeds}...'
@@ -648,26 +800,6 @@ def main(_):
     print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
     raise
 
-  if _RUN_INFERENCE.value:
-    # Fail early on incompatible devices, but only if we're running inference.
-    gpu_devices = jax.local_devices(backend='gpu')
-    if gpu_devices:
-      compute_capability = float(gpu_devices[0].compute_capability)
-      if compute_capability < 6.0:
-        raise ValueError(
-            'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
-            ' https://developer.nvidia.com/cuda-gpus).'
-        )
-      elif 7.0 <= compute_capability < 8.0:
-        xla_flags = os.environ.get('XLA_FLAGS')
-        required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
-        if not xla_flags or required_flag not in xla_flags:
-          raise ValueError(
-              'For devices with GPU compute capability 7.x (see'
-              ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
-              f' include "{required_flag}".'
-          )
-
   notice = textwrap.wrap(
       'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
       ' parameters are only available under terms of use provided at'
@@ -682,28 +814,30 @@ def main(_):
   print('\n'.join(notice))
 
   if _RUN_DATA_PIPELINE.value:
-    expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-    max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+    replace_db_dir = lambda x: string.Template(x).substitute(
+        DB_DIR=_DB_DIR.value
+    )
     data_pipeline_config = pipeline.DataPipelineConfig(
         jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
         nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
         hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
         hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
         hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-        small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-        mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-        uniprot_cluster_annot_database_path=expand_path(
+        small_bfd_database_path=replace_db_dir(_SMALL_BFD_DATABASE_PATH.value),
+        mgnify_database_path=replace_db_dir(_MGNIFY_DATABASE_PATH.value),
+        uniprot_cluster_annot_database_path=replace_db_dir(
             _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
         ),
-        uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-        ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-        rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-        rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-        pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-        seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+        uniref90_database_path=replace_db_dir(_UNIREF90_DATABASE_PATH.value),
+        ntrna_database_path=replace_db_dir(_NTRNA_DATABASE_PATH.value),
+        rfam_database_path=replace_db_dir(_RFAM_DATABASE_PATH.value),
+        rna_central_database_path=replace_db_dir(
+            _RNA_CENTRAL_DATABASE_PATH.value
+        ),
+        pdb_database_path=replace_db_dir(_PDB_DATABASE_PATH.value),
+        seqres_database_path=replace_db_dir(_SEQRES_DATABASE_PATH.value),
         jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
         nhmmer_n_cpu=_NHMMER_N_CPU.value,
-        max_template_date=max_template_date,
     )
   else:
     print('Skipping running the data pipeline.')
@@ -719,31 +853,28 @@ def main(_):
         config=make_model_config(
             flash_attention_implementation=typing.cast(
                 attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-            ),
-            num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+            ),ref_time_steps=_REF_TIME_STEPS.value
         ),
         device=devices[0],
-        model_dir=pathlib.Path(MODEL_DIR.value),
+        model_dir=pathlib.Path(_MODEL_DIR.value),
     )
   else:
     print('Skipping running model inference.')
     model_runner = None
 
-  print('Processing fold inputs.')
-  num_fold_inputs = 0
+  print(f'Processing {len(fold_inputs)} fold inputs.')
   for fold_input in fold_inputs:
-    print(f'Processing fold input #{num_fold_inputs + 1}')
     process_fold_input(
         fold_input=fold_input,
         data_pipeline_config=data_pipeline_config,
         model_runner=model_runner,
         output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
-        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+        ref_pdb_path=_REF_PDB_PATH.value,
+        ref_pkl_dump_path=_REF_PKL_DUMP_PATH.value,
+        buckets=_BUCKETS
     )
-    num_fold_inputs += 1
 
-  print(f'Done processing {num_fold_inputs} fold inputs.')
+  print(f'Done processing {len(fold_inputs)} fold inputs.')
 
 
 if __name__ == '__main__':
